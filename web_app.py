@@ -18,20 +18,21 @@ st.set_page_config(page_title="ADS 文献分析引擎", page_icon="🌌", layout
 # 💡 强力 CSS 控制：解决顶部留白、标题对齐、按钮文字出图问题
 st.markdown("""
     <style>
-        /* 1. 整体页面平移 */
-        .block-container {
-            padding-top: 1.5rem !important;
-            padding-bottom: 1rem !important;
-        }
-        /* 2. 强制按钮内文字不换行，并缩小左右边距防止溢出 */
+        .block-container { padding-top: 1.5rem !important; }
+        /* 强制按钮文字自动换行并垂直居中 */
         div[data-testid="stButton"] button {
-            padding: 0rem 0.6rem !important;
-            height: 2.6rem !important;
+            height: auto !important;
             min-height: 2.6rem !important;
+            padding: 0.4rem 0.6rem !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
         }
         div[data-testid="stButton"] button p {
-            font-size: 13.5px !important;
-            white-space: nowrap !important;
+            white-space: normal !important;
+            word-break: break-word !important;
+            line-height: 1.2 !important;
+            font-size: 13px !important;
         }
     </style>
 """, unsafe_allow_html=True)
@@ -72,7 +73,7 @@ for key, val in {
 
 cfg = st.session_state.config
 
-# 💡 新增：在这里提前定义弹窗函数，这样走到下面第 3 部分时就不会报错了
+# 提前定义弹窗函数
 @st.dialog("🪟 全屏编辑 AI 提炼指令", width="large")
 def show_prompt_editor_dialog():
     st.info("💡 在这里您可以拥有更宽广的视野来精细调优您的 System Prompt。")
@@ -86,11 +87,9 @@ def show_prompt_editor_dialog():
 # ==================== 3. 左侧系统边栏 ====================
 with st.sidebar:
     st.header("⚙️ 系统全局配置")
-    # 💡 彻底抛弃手动输入路径，系统在后台自动建一个临时文件夹存放下载的 PDF
     cfg["DOWNLOAD_DIR"] = "ADS_Papers_Temp"
     os.makedirs(cfg["DOWNLOAD_DIR"], exist_ok=True)
     
-    # 安全获取密钥函数（兼容本地与云端）
     def get_safe_token(key):
         try:
             return st.secrets[key]
@@ -102,10 +101,8 @@ with st.sidebar:
     cfg["DEEPSEEK_API_KEY"] = st.text_input("🧠 DeepSeek Token", value=get_safe_token("DEEPSEEK_API_KEY"), type="password")
     
     st.subheader("📝 AI 提炼指令")
-    # 把侧边栏的输入框变成一个小预览框
     cfg["SYSTEM_PROMPT"] = st.text_area("System Prompt (预览)", value=cfg["SYSTEM_PROMPT"], height=100)
     
-    # 💡 召唤全屏编辑器的按钮
     if st.button("🪟 放大全屏编辑", use_container_width=True):
         show_prompt_editor_dialog()
         
@@ -191,18 +188,26 @@ def step1_download_papers(papers, progress_callback=None):
     target_dir = cfg["DOWNLOAD_DIR"]
     os.makedirs(target_dir, exist_ok=True)
     meta_file = os.path.join(target_dir, "ads_metadata.json")
-    meta_dict = json.load(open(meta_file, 'r', encoding='utf-8')) if os.path.exists(meta_file) else {}
+    
+    # 💡 强力修复 1：安全的 JSON 加载，防止文件损坏导致整体崩溃
+    meta_dict = {}
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                meta_dict = json.load(f)
+        except Exception:
+            pass
         
-    dl, pr = 0, 0
+    dl_success_count = 0
+    pr = 0
     total_pool = len(papers)
     
     for p in papers:
         if st.session_state.stop_process: break
         pr += 1
-        if progress_callback: progress_callback(pr, total_pool)
-        
         bib = p.get("bibcode", "unknown")
         fn = f"{sanitize_filename(bib)}.pdf"
+        
         meta_dict[fn] = {
             "bibcode": bib, "标题": p.get("title", [""])[0], 
             "DOI": (p.get("doi", []) + ["无 DOI"])[0] if p.get("doi") else "无 DOI",
@@ -211,24 +216,41 @@ def step1_download_papers(papers, progress_callback=None):
         }
         
         fp = os.path.join(target_dir, fn)
-        if os.path.exists(fp): continue
+        if os.path.exists(fp):
+            dl_success_count += 1
+            if progress_callback: progress_callback(pr, total_pool, f"已存在: {bib}")
+            continue
         
         urls = find_download_links(p)
         success = False
         for name, url in urls:
-            if download_file(url, fp)[0]:
-                dl += 1
+            is_ok, msg = download_file(url, fp)
+            if is_ok:
+                dl_success_count += 1
                 success = True
                 break
-        time.sleep(1)
         
-    with open(meta_file, 'w', encoding='utf-8') as f: json.dump(meta_dict, f, ensure_ascii=False, indent=4)
-    return dl
+        if progress_callback:
+            status_msg = f"✅ 成功: {bib}" if success else f"❌ 失败: {bib}"
+            progress_callback(pr, total_pool, status_msg)
+        time.sleep(0.5)
+        
+    with open(meta_file, 'w', encoding='utf-8') as f:
+        json.dump(meta_dict, f, ensure_ascii=False, indent=4, default=lambda o: list(o) if isinstance(o, set) else str(o))
+    return dl_success_count
 
 def step2_extract_papers(papers, active_ai, progress_callback=None):
     target_dir = cfg["DOWNLOAD_DIR"]
     meta_file = os.path.join(target_dir, "ads_metadata.json")
-    meta_dict = json.load(open(meta_file, 'r', encoding='utf-8')) if os.path.exists(meta_file) else {}
+    
+    # 💡 强力修复 2：同步加入安全的 JSON 加载
+    meta_dict = {}
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                meta_dict = json.load(f)
+        except Exception:
+            pass
         
     output_csv = os.path.join(target_dir, f"Dataset_Extraction.csv")
     existing_files = pd.read_csv(output_csv)['文件名'].tolist() if os.path.exists(output_csv) else []
@@ -240,7 +262,7 @@ def step2_extract_papers(papers, active_ai, progress_callback=None):
     for p in papers:
         if st.session_state.stop_process: break
         pr += 1
-        if progress_callback: progress_callback(pr, tot)
+        if progress_callback: progress_callback(pr, tot, f"研读: {p.get('bibcode', '未知')}")
         
         bib = p.get("bibcode", "unknown")
         fn = f"{sanitize_filename(bib)}.pdf"
@@ -261,16 +283,6 @@ def step2_extract_papers(papers, active_ai, progress_callback=None):
     return new_ext
 
 # ==================== 5. Web 弹窗 (Dialogs) ====================
-@st.dialog("🪟 全屏编辑 AI 提炼指令", width="large")
-def show_prompt_editor_dialog():
-    st.info("💡 在这里您可以拥有更宽广的视野来精细调优您的 System Prompt。")
-    new_prompt = st.text_area("系统指令 (System Prompt)", value=cfg["SYSTEM_PROMPT"], height=450, label_visibility="collapsed")
-    
-    if st.button("💾 保存并应用指令", type="primary", use_container_width=True):
-        cfg["SYSTEM_PROMPT"] = new_prompt
-        save_config(cfg)
-        st.rerun()
-
 @st.dialog("📄 文献详情与摘要", width="large")
 def show_abstract_dialog(p, ai_type):
     title = p.get('title',['无标题'])[0]
@@ -286,7 +298,6 @@ def show_abstract_dialog(p, ai_type):
         c2.markdown(f"**🕒【时 间】**： {p.get('pubdate', '未知')}")
         c3, c4 = st.columns(2)
         doi_val = p.get('doi', ['无'])[0] if p.get('doi') else "无"
-        # 💡 使用 Markdown 的行内代码语法，让标题和内容保持在同一行
         c3.markdown(f"**🔗【DOI】**： `{doi_val}`")
         c4.markdown(f"**🔖【Bibcode】**： `{p.get('bibcode', '未知')}`")
 
@@ -350,12 +361,36 @@ def show_ai_report_dialog(p, ai_type):
     else:
         status_text.error(f"❌ AI 通讯失败: {res}")
 
+# 💡 强力修复 3：使用独立的回调函数执行移除，这样弹窗绝对不会自己关闭！
+def remove_from_cart(b):
+    st.session_state.selected_bibcodes.discard(b)
 
-# ==================== 6. 主界面 ====================
+@st.dialog("🛒 待下载文献清单", width="large")
+def show_cart_dialog():
+    selected_bibs = list(st.session_state.selected_bibcodes)
+    selected_papers = [p for p in st.session_state.papers if p["bibcode"] in selected_bibs]
+    
+    if not selected_papers:
+        st.info("清单已空，请点击弹窗外任意位置或右上角 X 关闭。")
+        return
+
+    st.markdown(f"### 📦 当前勾选 **{len(selected_papers)}** 篇")
+    
+    for i, p in enumerate(selected_papers):
+        bib = p["bibcode"]
+        col_text, col_btn = st.columns([8.5, 1.5])
+        col_text.write(f"{i+1}. {p.get('title',[''])[0][:80]}...")
+        # 绑定 on_click 回调，不主动触发 rerun，完美实现内部刷新不退弹窗！
+        col_btn.button("❌ 移除", key=f"cart_rm_{bib}", on_click=remove_from_cart, args=(bib,), use_container_width=True)
+
+def clear_cache_after_download():
+    st.session_state.selected_bibcodes.clear()
+    st.session_state.zip_ready = False
+    st.session_state.select_all_toggle = False
+
 # ==================== 6. 主界面 ====================
 st.markdown("## 🌌 ADS 天体物理文献分析引擎")
 
-# 💡 新增：系统使用指南（折叠面板）
 with st.expander("📖 系统使用指南 (新手必读)", expanded=False):
     st.markdown("""
     欢迎使用本专属科研工作站！本工具专为天文学文献检索与数据提取打造，请按照以下步骤开启高效科研：
@@ -373,7 +408,6 @@ with st.expander("📖 系统使用指南 (新手必读)", expanded=False):
     """)
 
 with st.expander("🔍 检索参数", expanded=len(st.session_state.papers)==0):
-    # 💡 核心修复 2：优化列布局，并在复选框上方增加隐形占位符对齐
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         keyword = st.text_input("关键词", "solar-type")
@@ -388,7 +422,6 @@ with st.expander("🔍 检索参数", expanded=len(st.session_state.papers)==0):
         active_ai = st.selectbox("AI 引擎", ["minimax", "deepseek"])
         st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
         do_ai_extract = st.checkbox("自动 AI 提炼 (CSV)")
-        # （ZIP 勾选框已经被删除了，因为现在是强制打包模式）
 
 loc_map = {"全部字段 (All)": "all", "仅标题 (Title)": "title", "仅摘要 (Abstract)": "abs", "仅关键词 (Keyword)": "keyword"}
 sort_map = {
@@ -397,16 +430,14 @@ sort_map = {
 }
 
 st.markdown("### 🚀 执行工作流")
-act1, act2, act3, act4 = st.columns([2.5, 2, 3, 1.5])
+act1, act2, act3, act4, act5 = st.columns([1.8, 1.6, 1.8, 2.8, 1.2])
 
 with act1:
     if st.button("🔍 1. 检索文献", type="primary", use_container_width=True):
         st.session_state.selected_bibcodes.clear()
         st.session_state.current_page = 0
         st.session_state.select_all_toggle = False
-        
         api_sort_method = sort_map[st.session_state.sort_selector]
-        
         kw_str = keyword.strip()
         loc_val = loc_map[loc]
         if "," in kw_str or "，" in kw_str:
@@ -420,7 +451,6 @@ with act1:
         if pt and pt.lower() != "all" and "全库" not in pt:
             j_parts = [f'bibstem:"{j.strip()}"' for j in re.split(r'[,，]', pt) if j.strip()]
             if j_parts: q_str += f' AND ({" OR ".join(j_parts)})'
-
         if start_date and end_date: q_str += f' AND pubdate:[{start_date} TO {end_date}]'
         
         with st.spinner("检索中..."):
@@ -428,67 +458,79 @@ with act1:
         st.rerun()
 
 with act2:
-    btn_label = "✅ 取消全选" if st.session_state.select_all_toggle else "⬜ 一键全选"
-    if st.button(btn_label, use_container_width=True):
-        st.session_state.select_all_toggle = not st.session_state.select_all_toggle
-        if st.session_state.select_all_toggle:
+    if len(st.session_state.selected_bibcodes) > 0:
+        if st.button("🗑️ 清空购物车", use_container_width=True):
+            clear_cache_after_download()
+            st.rerun()
+    else:
+        btn_disabled = len(st.session_state.papers) == 0
+        if st.button("🛒 全部加购", use_container_width=True, disabled=btn_disabled):
             st.session_state.selected_bibcodes = set([p['bibcode'] for p in st.session_state.papers])
-        else:
-            st.session_state.selected_bibcodes.clear()
-        st.rerun()
+            st.rerun()
 
 with act3:
-    if st.button("📥 2. 批量处理选中项", type="primary", use_container_width=True):
-        if not st.session_state.selected_bibcodes:
-            st.warning("请先勾选需要处理的文献！")
-        else:
-            st.session_state.stop_process = False
-            papers_to_process = [p for p in st.session_state.papers if p["bibcode"] in st.session_state.selected_bibcodes]
-            tot = len(papers_to_process)
-            
-            progress_bar = st.progress(0, text="批量处理进度...")
-            def dl_cb(curr, total): progress_bar.progress(curr/total * (0.5 if do_ai_extract else 1.0), text=f"下载进度: {curr}/{total}")
-            dl_count = step1_download_papers(papers_to_process, dl_cb)
-            
-            new_ext = 0
-            if do_ai_extract and not st.session_state.stop_process:
-                def ai_cb(curr, total): progress_bar.progress(0.5 + curr/total * 0.5, text=f"AI 解析进度: {curr}/{total}")
-                new_ext = step2_extract_papers(papers_to_process, active_ai, ai_cb)
-            
-            if st.session_state.stop_process:
-                st.warning("⛔ 处理已中止！")
-            else:
-                # 💡 无论本地还是云端，直接把下好的 PDF 和提炼的 CSV 强制打包成 ZIP
-                zip_path = os.path.join(cfg["DOWNLOAD_DIR"], "ADS_Selected_Papers.zip")
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for bib in st.session_state.selected_bibcodes:
-                        fn = f"{sanitize_filename(bib)}.pdf"
-                        fp = os.path.join(cfg["DOWNLOAD_DIR"], fn)
-                        if os.path.exists(fp):
-                            zf.write(fp, arcname=fn)
-                    csv_path = os.path.join(cfg["DOWNLOAD_DIR"], "Dataset_Extraction.csv")
-                    if do_ai_extract and os.path.exists(csv_path):
-                        zf.write(csv_path, arcname="Dataset_Extraction.csv")
-                
-                # 标记压缩包准备完毕
-                st.session_state.zip_ready = True
-
-                msg = f"✅ 批量处理完成！下载 {dl_count} 篇 PDF。"
-                if do_ai_extract: msg += f" AI 提炼提取 {new_ext} 篇数据。"
-                st.success(msg)
-                
-                # 停顿1秒后刷新页面，让旁边的下载按钮亮起
-                time.sleep(1)
-                st.rerun()
+    cart_count = len(st.session_state.selected_bibcodes)
+    if cart_count > 0:
+        if st.button(f"🛒 查看/修改清单 ({cart_count})", use_container_width=True):
+            show_cart_dialog()
+    else:
+        st.button(f"🛒 查看清单 (0)", disabled=True, use_container_width=True)
 
 with act4:
-    # 💡 专属 ZIP 下载按钮（去掉了勾选框的判断逻辑，只要有包就给下）
-    zip_path = os.path.join(cfg["DOWNLOAD_DIR"], "ADS_Selected_Papers.zip")
-    if st.session_state.get("zip_ready") and os.path.exists(zip_path):
-        with open(zip_path, "rb") as f:
-            st.download_button("📦 下载 ZIP", data=f, file_name="ADS_Selected_Papers.zip", mime="application/zip", use_container_width=True, type="primary")
+    if cart_count > 0:
+        kw_clean = sanitize_filename(keyword.strip()) if keyword.strip() else "All"
+        zip_name = f"ADS_{kw_clean}.zip"
+        zip_path = os.path.join(cfg["DOWNLOAD_DIR"], zip_name)
+        
+        # 1. 未生成压缩包：显示处理进度流
+        if not st.session_state.get("zip_ready"):
+            if st.button("🚀 2. 一键打包并下载", type="primary", use_container_width=True):
+                with st.status("🛠️ 正在处理，请稍后...", expanded=True) as status:
+                    papers_to_process = [p for p in st.session_state.papers if p["bibcode"] in st.session_state.selected_bibcodes]
+                    
+                    p_bar = st.progress(0)
+                    p_text = st.empty()
+                    
+                    def update_ui(curr, total, msg):
+                        p_bar.progress(curr/total)
+                        p_text.text(f"进度: {curr}/{total} - {msg}")
+
+                    final_dl_count = step1_download_papers(papers_to_process, update_ui)
+                    
+                    # 💡 强力修复 4：修复了缺失的 ZIP 打包实际逻辑和缩进！
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for bib in st.session_state.selected_bibcodes:
+                            fn = f"{sanitize_filename(bib)}.pdf"
+                            fp = os.path.join(cfg["DOWNLOAD_DIR"], fn)
+                            if os.path.exists(fp): 
+                                zf.write(fp, arcname=fn)
+                        csv_path = os.path.join(cfg["DOWNLOAD_DIR"], "Dataset_Extraction.csv")
+                        if do_ai_extract and os.path.exists(csv_path): 
+                            zf.write(csv_path, arcname="Dataset_Extraction.csv")
+                    
+                    st.session_state.zip_ready = True
+                    st.session_state.current_zip_path = zip_path
+                    status.update(label="✅ 打包完成！点击下方按钮保存", state="complete")
+                    st.rerun()
+        
+        # 2. 已生成压缩包：变成红色下载按钮
+        else:
+            with open(st.session_state.current_zip_path, "rb") as f:
+                st.download_button(
+                    label="💾 3. 立即保存 ZIP 到本地",
+                    data=f,
+                    file_name=os.path.basename(st.session_state.current_zip_path),
+                    mime="application/zip",
+                    use_container_width=True,
+                    type="primary",
+                    on_click=clear_cache_after_download
+                )
     else:
-        st.button("📦 下载 ZIP", disabled=True, use_container_width=True)
+        st.button("🚀 2. 处理下载", disabled=True, use_container_width=True)
+
+with act5:
+    if st.button("🛑 中止", use_container_width=True):
+        st.session_state.stop_process = True
 
 
 # ==================== 7. 展示结果 ====================
@@ -497,7 +539,6 @@ if st.session_state.papers:
     
     head_col, sort_col, _ = st.columns([6, 3, 3])
     with head_col:
-        # 💡 核心修复 1：把“已勾选数量”完美加回标题中
         st.markdown(f"<div style='font-size: 1.35rem; font-weight: 600; margin-top: 0.7rem;'>📚 检索结果 (命中: {st.session_state.total_found} 篇，已勾选: {len(st.session_state.selected_bibcodes)} 篇)</div>", unsafe_allow_html=True)
     with sort_col:
         st.selectbox("排序", ["🔥 引用量 (由高到低)", "🔥 引用量 (由低到高)", "🕒 发表时间 (由新到旧)", "🕒 发表时间 (由旧到新)"], key="sort_selector", label_visibility="collapsed")
@@ -522,30 +563,21 @@ if st.session_state.papers:
     for i, p in enumerate(current_list[start_idx:start_idx+PAPERS_PER_PAGE]):
         with st.container(border=True):
             bib = p["bibcode"]
-            c_chk, c_info, c_b1, c_b2, c_b3 = st.columns([0.4, 6.3, 1.1, 1.1, 1.1])
             
-            chk_key = f"chk_{bib}"
-            st.session_state[chk_key] = (bib in st.session_state.selected_bibcodes)
-            def sync_check(b=bib, k=chk_key):
-                if st.session_state[k]: st.session_state.selected_bibcodes.add(b)
-                else: st.session_state.selected_bibcodes.discard(b)
-            
-            c_chk.checkbox("", key=chk_key, on_change=sync_check)
+            c_info, c_b1, c_b2, c_b3 = st.columns([6.7, 1.1, 1.1, 1.1])
             c_info.markdown(f"**{start_idx+i+1}.** [{p.get('pubdate','?')}] **{p.get('title',[''])[0]}**")
             
             if c_b1.button("📄 摘要", key=f"ab_{i}", use_container_width=True): show_abstract_dialog(p, active_ai)
             if c_b2.button("AI 研读", key=f"ai_{i}", use_container_width=True, type="primary"): show_ai_report_dialog(p, active_ai)
-            if c_b3.button("📥 下载", key=f"dl_{i}", use_container_width=True):
-                fp = os.path.join(cfg["DOWNLOAD_DIR"], f"{sanitize_filename(bib)}.pdf")
-                if os.path.exists(fp):
-                    st.info("已存在本地！")
-                else:
-                    urls = find_download_links(p)
-                    succ = False
-                    for _, u in urls:
-                        if download_file(u, fp)[0]: succ = True; break
-                    if succ: st.toast("✅ 下载成功！")
-                    else: st.error("❌ 下载失败")
+            
+            if bib in st.session_state.selected_bibcodes:
+                if c_b3.button("❌ 移出清单", key=f"dl_{i}", use_container_width=True):
+                    st.session_state.selected_bibcodes.discard(bib)
+                    st.rerun() 
+            else:
+                if c_b3.button("➕ 加清单", key=f"dl_{i}", use_container_width=True):
+                    st.session_state.selected_bibcodes.add(bib)
+                    st.rerun() 
                     
     st.markdown("<br>", unsafe_allow_html=True)
     bc1, bc2, bc3, bc4 = st.columns([1.5, 2.5, 1.5, 6.5])
