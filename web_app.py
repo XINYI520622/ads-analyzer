@@ -10,23 +10,27 @@ import html
 from collections import Counter
 from openai import OpenAI
 from anthropic import Anthropic
+import zipfile
 
-# ==================== 1. 页面基本配置 & CSS 终极魔法 ====================
+# ==================== 1. 页面基本配置 & CSS 终极修正 ====================
 st.set_page_config(page_title="ADS 文献分析引擎", page_icon="🌌", layout="wide")
 
-# 💡 强力 CSS 控制：修复文字溢出，缩小字体，整体向上平移
+# 💡 强力 CSS 控制：解决顶部留白、标题对齐、按钮文字出图问题
 st.markdown("""
     <style>
+        /* 1. 整体页面平移 */
         .block-container {
             padding-top: 1.5rem !important;
             padding-bottom: 1rem !important;
         }
-        /* 缩小按钮内的字体，适度减少内边距，让文字乖乖呆在框内 */
+        /* 2. 强制按钮内文字不换行，并缩小左右边距防止溢出 */
         div[data-testid="stButton"] button {
-            padding: 0.2rem 0.5rem !important;
+            padding: 0rem 0.6rem !important;
+            height: 2.6rem !important;
+            min-height: 2.6rem !important;
         }
         div[data-testid="stButton"] button p {
-            font-size: 13px !important;
+            font-size: 13.5px !important;
             white-space: nowrap !important;
         }
     </style>
@@ -37,8 +41,6 @@ CONFIG_FILE = "app_config.json"
 default_config = {
     "ADS_API_TOKEN": "", "MINIMAX_API_KEY": "", "DEEPSEEK_API_KEY": "",
     "DOWNLOAD_DIR": "D:/ADS_Papers",
-    "FONT_SIZE": 14,
-    "THEME_MODE": "light",
     "SYSTEM_PROMPT": """你是一个资深的天体物理学研究员。请阅读提供的论文文本，寻找“类太阳恒星”的定义，重点关注Introduction、Sample Selection或Methods部分。请提取具体参数并严格以JSON格式输出：\n{\n    \"研究对象\": \"简明扼要说明研究的天体\",\n    \"类太阳恒星的定义标准\": \"总结作者界定类太阳恒星的具体物理参数标准。\",\n    \"论文概括\": \"100字以内概括核心工作\",\n    \"创新点\": \"一两句话概括创新之处\"\n}"""
 }
 
@@ -60,54 +62,72 @@ def save_config(config_data):
 if "config" not in st.session_state:
     st.session_state.config = load_config()
 
-if "papers" not in st.session_state: st.session_state.papers = []
-if "selected_bibcodes" not in st.session_state: st.session_state.selected_bibcodes = set()
-if "total_found" not in st.session_state: st.session_state.total_found = 0
-if "stop_process" not in st.session_state: st.session_state.stop_process = False
-if "select_all_toggle" not in st.session_state: st.session_state.select_all_toggle = False
-if "current_page" not in st.session_state: st.session_state.current_page = 0
-if "sort_selector" not in st.session_state: st.session_state.sort_selector = "🔥 引用量 (由高到低)"
+# 状态变量初始化
+for key, val in {
+    "papers": [], "selected_bibcodes": set(), "total_found": 0,
+    "stop_process": False, "select_all_toggle": False, "current_page": 0,
+    "sort_selector": "🔥 引用量 (由高到低)"
+}.items():
+    if key not in st.session_state: st.session_state[key] = val
 
 cfg = st.session_state.config
+
+# 💡 新增：在这里提前定义弹窗函数，这样走到下面第 3 部分时就不会报错了
+@st.dialog("🪟 全屏编辑 AI 提炼指令", width="large")
+def show_prompt_editor_dialog():
+    st.info("💡 在这里您可以拥有更宽广的视野来精细调优您的 System Prompt。")
+    new_prompt = st.text_area("系统指令 (System Prompt)", value=cfg["SYSTEM_PROMPT"], height=450, label_visibility="collapsed")
+    
+    if st.button("💾 保存并应用指令", type="primary", use_container_width=True):
+        cfg["SYSTEM_PROMPT"] = new_prompt
+        save_config(cfg)
+        st.rerun()
 
 # ==================== 3. 左侧系统边栏 ====================
 with st.sidebar:
     st.header("⚙️ 系统全局配置")
-    st.markdown("---")
+    # 💡 彻底抛弃手动输入路径，系统在后台自动建一个临时文件夹存放下载的 PDF
+    cfg["DOWNLOAD_DIR"] = "ADS_Papers_Temp"
+    os.makedirs(cfg["DOWNLOAD_DIR"], exist_ok=True)
     
-    cfg["DOWNLOAD_DIR"] = st.text_input("📁 PDF 保存路径", value=cfg["DOWNLOAD_DIR"])
-    
-    # 💡 终极安全写法：优先从云端 Secrets 读，如果云端没有，就回退去读本地的 cfg
-    cfg["ADS_API_TOKEN"] = st.text_input("🔑 ADS API 密钥", value=st.secrets.get("ADS_API_TOKEN", cfg.get("ADS_API_TOKEN", "")), type="password")
-    cfg["MINIMAX_API_KEY"] = st.text_input("🧠 MiniMax Token", value=st.secrets.get("MINIMAX_API_KEY", cfg.get("MINIMAX_API_KEY", "")), type="password")
-    cfg["DEEPSEEK_API_KEY"] = st.text_input("🧠 DeepSeek Token", value=st.secrets.get("DEEPSEEK_API_KEY", cfg.get("DEEPSEEK_API_KEY", "")), type="password")
-    
-    st.markdown("---")
-    st.subheader("📝 AI 批量提炼指令 (用于CSV)")
-    cfg["SYSTEM_PROMPT"] = st.text_area("System Prompt", value=cfg["SYSTEM_PROMPT"], height=200)
-    
-    if st.button("💾 保存配置到本地", use_container_width=True):
-        save_config(cfg)
-        st.success("配置已永久保存！")
+    # 安全获取密钥函数（兼容本地与云端）
+    def get_safe_token(key):
+        try:
+            return st.secrets[key]
+        except Exception:
+            return cfg.get(key, "")
 
-# ==================== 4. 后台业务逻辑库 ====================
+    cfg["ADS_API_TOKEN"] = st.text_input("🔑 ADS API 密钥", value=get_safe_token("ADS_API_TOKEN"), type="password")
+    cfg["MINIMAX_API_KEY"] = st.text_input("🧠 MiniMax Token", value=get_safe_token("MINIMAX_API_KEY"), type="password")
+    cfg["DEEPSEEK_API_KEY"] = st.text_input("🧠 DeepSeek Token", value=get_safe_token("DEEPSEEK_API_KEY"), type="password")
+    
+    st.subheader("📝 AI 提炼指令")
+    # 把侧边栏的输入框变成一个小预览框
+    cfg["SYSTEM_PROMPT"] = st.text_area("System Prompt (预览)", value=cfg["SYSTEM_PROMPT"], height=100)
+    
+    # 💡 召唤全屏编辑器的按钮
+    if st.button("🪟 放大全屏编辑", use_container_width=True):
+        show_prompt_editor_dialog()
+        
+    if st.button("💾 保存所有配置", use_container_width=True, type="primary"):
+        save_config(cfg)
+        st.success("配置已安全保存！")
+
+# ==================== 4. 后台逻辑 ====================
 
 def sanitize_filename(name): return re.sub(r'[^\w\-_.]', '_', name)
 
 def search_ads(query, rows, sort_method):
     url = "https://api.adsabs.harvard.edu/v1/search/query"
     headers = {"Authorization": f"Bearer {cfg['ADS_API_TOKEN']}"}
-    params = {"q": query, "fl": "bibcode,title,author,year,pubdate,doi,pub,bibstem,links_data,abstract,citation_count", "rows": rows, "sort": sort_method}
+    params = {"q": query, "fl": "bibcode,title,author,year,pubdate,doi,pub,abstract,citation_count,links_data", "rows": rows, "sort": sort_method}
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=30)
         if resp.status_code == 200:
             data = resp.json()
             st.session_state.total_found = data.get('response', {}).get('numFound', 0)
             return data.get("response", {}).get("docs", [])
-        else:
-            st.error(f"ADS 检索失败 (HTTP {resp.status_code})。请检查网络或 Token。")
-    except Exception as e:
-        st.error(f"网络异常: {str(e)}")
+    except: pass
     return []
 
 def find_download_links(paper):
@@ -241,6 +261,15 @@ def step2_extract_papers(papers, active_ai, progress_callback=None):
     return new_ext
 
 # ==================== 5. Web 弹窗 (Dialogs) ====================
+@st.dialog("🪟 全屏编辑 AI 提炼指令", width="large")
+def show_prompt_editor_dialog():
+    st.info("💡 在这里您可以拥有更宽广的视野来精细调优您的 System Prompt。")
+    new_prompt = st.text_area("系统指令 (System Prompt)", value=cfg["SYSTEM_PROMPT"], height=450, label_visibility="collapsed")
+    
+    if st.button("💾 保存并应用指令", type="primary", use_container_width=True):
+        cfg["SYSTEM_PROMPT"] = new_prompt
+        save_config(cfg)
+        st.rerun()
 
 @st.dialog("📄 文献详情与摘要", width="large")
 def show_abstract_dialog(p, ai_type):
@@ -255,14 +284,11 @@ def show_abstract_dialog(p, ai_type):
         c1, c2 = st.columns(2)
         c1.markdown(f"**📚【期 刊】**： {p.get('pub', '未知期刊')}")
         c2.markdown(f"**🕒【时 间】**： {p.get('pubdate', '未知')}")
-        
         c3, c4 = st.columns(2)
-        c3.markdown("**🔗【DOI】**：")
         doi_val = p.get('doi', ['无'])[0] if p.get('doi') else "无"
-        c3.code(doi_val, language=None)
-        
-        c4.markdown("**🔖【Bibcode】**：")
-        c4.code(p.get('bibcode', '未知'), language=None)
+        # 💡 使用 Markdown 的行内代码语法，让标题和内容保持在同一行
+        c3.markdown(f"**🔗【DOI】**： `{doi_val}`")
+        c4.markdown(f"**🔖【Bibcode】**： `{p.get('bibcode', '未知')}`")
 
     clean_text = clean_abs_text(p.get("abstract", ""))
     st.markdown("### 📝 摘要正文")
@@ -325,28 +351,44 @@ def show_ai_report_dialog(p, ai_type):
         status_text.error(f"❌ AI 通讯失败: {res}")
 
 
-# ==================== 6. 主界面排版与检索 ====================
-
+# ==================== 6. 主界面 ====================
+# ==================== 6. 主界面 ====================
 st.markdown("## 🌌 ADS 天体物理文献分析引擎")
 
-is_expanded = len(st.session_state.papers) == 0
+# 💡 新增：系统使用指南（折叠面板）
+with st.expander("📖 系统使用指南 (新手必读)", expanded=False):
+    st.markdown("""
+    欢迎使用本专属科研工作站！本工具专为天文学文献检索与数据提取打造，请按照以下步骤开启高效科研：
+    
+    * **⚙️ 零：配置环境**
+        首次使用，请在左侧边栏填写您的 `ADS API 密钥` 及 `AI 引擎 Token`。下方的“AI 提炼指令”可自由修改（默认用于提取物理参数等核心指标）。
+    * **🔍 一：精准检索**
+        在下方展开“检索参数”，输入目标。例如输入 `solar-type`，或者查找《太阳物理学导论》相关的概念如 `solar flares`、`coronal mass ejections` 等。按需限制期刊库（如 `ApJ, A&A`），点击 **[检索文献]**。
+    * **✨ 二：单篇速览与研读**
+        在检索结果中，点击 **[📄 摘要]** 可查看 DOI 等详情，并支持一键强力转换标准简体中文；点击 **[AI 研读]** 可让 AI 代跑全文，直接生成“背景-方法-结论”总结报告。
+    * **📦 三：批量下载与数据提炼（云端终极连招）**
+        1️⃣ 勾选所需的文献（或一键全选）。
+        2️⃣ 点击红色的 **[📥 2. 批量处理选中项]**。云端服务器会开始狂飙，在后台自动抓取 PDF 并用 AI 提炼数据为 Excel(CSV) 表格。
+        3️⃣ 等待提示成功后，点击旁边亮起的 **[📦 下载 ZIP]** 按钮，将所有战利品一键打包带回你的电脑！
+    """)
 
-with st.expander("🔍 配置高级检索参数", expanded=is_expanded):
+with st.expander("🔍 检索参数", expanded=len(st.session_state.papers)==0):
+    # 💡 核心修复 2：优化列布局，并在复选框上方增加隐形占位符对齐
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        keyword = st.text_input("目标关键词", "solar-type", help="支持逗号分隔多词 (AND)")
-        start_date = st.text_input("检索起始期", "2022-01")
-        author = st.text_input("指定作者", placeholder="留空则不限")
+        keyword = st.text_input("关键词", "solar-type")
+        start_date = st.text_input("起始期", "2022-01")
     with c2:
-        loc = st.selectbox("检索限制域", ["全部字段 (All)", "仅标题 (Title)", "仅摘要 (Abstract)", "仅关键词 (Keyword)"])
-        end_date = st.text_input("检索终止期", "2024-05")
-        min_cite = st.number_input("最低引用量过滤", min_value=0, value=0)
+        loc = st.selectbox("检索域", ["全部字段 (All)", "仅标题 (Title)", "仅摘要 (Abstract)", "仅关键词 (Keyword)"])
+        end_date = st.text_input("终止期", "2024-05")
     with c3:
-        paper_type = st.text_input("目标期刊库", "ApJ, AJ, MNRAS, A&A", help="支持逗号分隔。留空为全库")
-        max_rows = st.number_input("抓取上限量", min_value=1, max_value=2000, value=500)
+        paper_type = st.text_input("期刊库", "ApJ, AJ, MNRAS, A&A")
+        max_rows = st.number_input("上限量", value=500)
     with c4:
-        active_ai = st.selectbox("底层 AI 引擎", ["minimax", "deepseek"])
-        do_ai_extract = st.checkbox("☑️ 下载后自动 AI 提炼 (CSV)", value=False)
+        active_ai = st.selectbox("AI 引擎", ["minimax", "deepseek"])
+        st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
+        do_ai_extract = st.checkbox("自动 AI 提炼 (CSV)")
+        # （ZIP 勾选框已经被删除了，因为现在是强制打包模式）
 
 loc_map = {"全部字段 (All)": "all", "仅标题 (Title)": "title", "仅摘要 (Abstract)": "abs", "仅关键词 (Keyword)": "keyword"}
 sort_map = {
@@ -355,10 +397,10 @@ sort_map = {
 }
 
 st.markdown("### 🚀 执行工作流")
-col_act1, col_act2, col_act3, col_act4 = st.columns([2.5, 2, 3, 1.5])
+act1, act2, act3, act4 = st.columns([2.5, 2, 3, 1.5])
 
-with col_act1:
-    if st.button("🔍 1. 检索网络文献", type="primary", use_container_width=True):
+with act1:
+    if st.button("🔍 1. 检索文献", type="primary", use_container_width=True):
         st.session_state.selected_bibcodes.clear()
         st.session_state.current_page = 0
         st.session_state.select_all_toggle = False
@@ -380,15 +422,12 @@ with col_act1:
             if j_parts: q_str += f' AND ({" OR ".join(j_parts)})'
 
         if start_date and end_date: q_str += f' AND pubdate:[{start_date} TO {end_date}]'
-        if author.strip(): q_str += f' AND author:"{author.strip()}"'
-        if min_cite > 0: q_str += f' AND citation_count:[{min_cite} TO *]'
         
-        with st.spinner("正在穿越星际网络寻找论文..."):
-            papers = search_ads(q_str, max_rows, api_sort_method)
-            st.session_state.papers = papers
+        with st.spinner("检索中..."):
+            st.session_state.papers = search_ads(q_str, max_rows, api_sort_method)
         st.rerun()
 
-with col_act2:
+with act2:
     btn_label = "✅ 取消全选" if st.session_state.select_all_toggle else "⬜ 一键全选"
     if st.button(btn_label, use_container_width=True):
         st.session_state.select_all_toggle = not st.session_state.select_all_toggle
@@ -398,10 +437,10 @@ with col_act2:
             st.session_state.selected_bibcodes.clear()
         st.rerun()
 
-with col_act3:
+with act3:
     if st.button("📥 2. 批量处理选中项", type="primary", use_container_width=True):
         if not st.session_state.selected_bibcodes:
-            st.warning("请先在下方列表中勾选需要处理的文献！")
+            st.warning("请先勾选需要处理的文献！")
         else:
             st.session_state.stop_process = False
             papers_to_process = [p for p in st.session_state.papers if p["bibcode"] in st.session_state.selected_bibcodes]
@@ -417,36 +456,53 @@ with col_act3:
                 new_ext = step2_extract_papers(papers_to_process, active_ai, ai_cb)
             
             if st.session_state.stop_process:
-                st.warning("⛔ 处理已紧急中止！数据已安全封存。")
+                st.warning("⛔ 处理已中止！")
             else:
-                msg = f"✅ 批量处理完成！成功下载 {dl_count} 篇 PDF。"
-                if do_ai_extract: msg += f" AI 成功提炼提取 {new_ext} 篇数据至 CSV。"
+                # 💡 无论本地还是云端，直接把下好的 PDF 和提炼的 CSV 强制打包成 ZIP
+                zip_path = os.path.join(cfg["DOWNLOAD_DIR"], "ADS_Selected_Papers.zip")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for bib in st.session_state.selected_bibcodes:
+                        fn = f"{sanitize_filename(bib)}.pdf"
+                        fp = os.path.join(cfg["DOWNLOAD_DIR"], fn)
+                        if os.path.exists(fp):
+                            zf.write(fp, arcname=fn)
+                    csv_path = os.path.join(cfg["DOWNLOAD_DIR"], "Dataset_Extraction.csv")
+                    if do_ai_extract and os.path.exists(csv_path):
+                        zf.write(csv_path, arcname="Dataset_Extraction.csv")
+                
+                # 标记压缩包准备完毕
+                st.session_state.zip_ready = True
+
+                msg = f"✅ 批量处理完成！下载 {dl_count} 篇 PDF。"
+                if do_ai_extract: msg += f" AI 提炼提取 {new_ext} 篇数据。"
                 st.success(msg)
+                
+                # 停顿1秒后刷新页面，让旁边的下载按钮亮起
+                time.sleep(1)
+                st.rerun()
 
-with col_act4:
-    if st.button("🛑 中止", use_container_width=True):
-        st.session_state.stop_process = True
-        st.toast("已发送停止指令...")
+with act4:
+    # 💡 专属 ZIP 下载按钮（去掉了勾选框的判断逻辑，只要有包就给下）
+    zip_path = os.path.join(cfg["DOWNLOAD_DIR"], "ADS_Selected_Papers.zip")
+    if st.session_state.get("zip_ready") and os.path.exists(zip_path):
+        with open(zip_path, "rb") as f:
+            st.download_button("📦 下载 ZIP", data=f, file_name="ADS_Selected_Papers.zip", mime="application/zip", use_container_width=True, type="primary")
+    else:
+        st.button("📦 下载 ZIP", disabled=True, use_container_width=True)
 
 
-# ==================== 7. 展示检索结果区 ====================
+# ==================== 7. 展示结果 ====================
 if st.session_state.papers:
     st.markdown("---")
     
-    # 💡 核心修复 1：通过自定义 HTML 实现标题与下拉框的完美水平对齐
-    head_col, sort_col, _ = st.columns([5.5, 3.5, 3])
+    head_col, sort_col, _ = st.columns([6, 3, 3])
     with head_col:
-        st.markdown(f"<div style='font-size: 1.35rem; font-weight: 600; margin-top: 0.6rem;'>📚 检索结果 (命中: {st.session_state.total_found} 篇，勾选: {len(st.session_state.selected_bibcodes)} 篇)</div>", unsafe_allow_html=True)
+        # 💡 核心修复 1：把“已勾选数量”完美加回标题中
+        st.markdown(f"<div style='font-size: 1.35rem; font-weight: 600; margin-top: 0.7rem;'>📚 检索结果 (命中: {st.session_state.total_found} 篇，已勾选: {len(st.session_state.selected_bibcodes)} 篇)</div>", unsafe_allow_html=True)
     with sort_col:
-        st.selectbox(
-            "排序方式", 
-            ["🔥 引用量 (由高到低)", "🔥 引用量 (由低到高)", "🕒 发表时间 (由新到旧)", "🕒 发表时间 (由旧到新)"],
-            key="sort_selector",
-            label_visibility="collapsed"
-        )
-        
-    sort_method = sort_map[st.session_state.sort_selector]
+        st.selectbox("排序", ["🔥 引用量 (由高到低)", "🔥 引用量 (由低到高)", "🕒 发表时间 (由新到旧)", "🕒 发表时间 (由旧到新)"], key="sort_selector", label_visibility="collapsed")
     
+    sort_method = sort_map[st.session_state.sort_selector]
     current_list = st.session_state.papers.copy()
     if sort_method == "citation_count desc": current_list.sort(key=lambda x: x.get("citation_count", 0), reverse=True)
     elif sort_method == "citation_count asc": current_list.sort(key=lambda x: x.get("citation_count", 0), reverse=False)
@@ -455,67 +511,44 @@ if st.session_state.papers:
 
     PAPERS_PER_PAGE = 10
     total_pages = max(1, (len(current_list) + PAPERS_PER_PAGE - 1) // PAPERS_PER_PAGE)
-    
     if st.session_state.current_page >= total_pages: st.session_state.current_page = max(0, total_pages - 1)
-        
-    start_idx = st.session_state.current_page * PAPERS_PER_PAGE
-    end_idx = start_idx + PAPERS_PER_PAGE
-    page_papers = current_list[start_idx:end_idx]
-
-    def change_page(delta):
-        st.session_state.current_page += delta
     
-    # 💡 核心修复 2：取消翻页按钮的无脑拉伸，让它自然显示，绝不折行
-    pc1, pc2, pc3, pc4 = st.columns([1, 2, 1, 8])
-    with pc1: st.button("⬅️ 上一页", key="prev_top", disabled=(st.session_state.current_page == 0), on_click=change_page, args=(-1,))
-    with pc2: st.markdown(f"<div style='text-align: center; margin-top: 5px; font-weight: bold;'>当前页: {st.session_state.current_page + 1} / {total_pages}</div>", unsafe_allow_html=True)
-    with pc3: st.button("下一页 ➡️", key="next_top", disabled=(st.session_state.current_page >= total_pages - 1), on_click=change_page, args=(1,))
+    pc1, pc2, pc3, pc4 = st.columns([1.5, 2.5, 1.5, 6.5])
+    with pc1: st.button("⬅️ 上一页", key="prev_top", disabled=st.session_state.current_page==0, on_click=lambda: setattr(st.session_state, 'current_page', st.session_state.current_page-1), use_container_width=True)
+    with pc2: st.markdown(f"<div style='text-align: center; margin-top: 5px; font-weight: bold;'>页码: {st.session_state.current_page + 1} / {total_pages}</div>", unsafe_allow_html=True)
+    with pc3: st.button("下一页 ➡️", key="next_top", disabled=st.session_state.current_page>=total_pages-1, on_click=lambda: setattr(st.session_state, 'current_page', st.session_state.current_page+1), use_container_width=True)
 
-    for i, p in enumerate(page_papers):
-        global_idx = start_idx + i + 1
-        bib = p["bibcode"]
-        title = p.get('title', ['无标题'])[0]
-        date = p.get('pubdate', '?')
-        cite = p.get('citation_count', 0)
-        
+    start_idx = st.session_state.current_page * PAPERS_PER_PAGE
+    for i, p in enumerate(current_list[start_idx:start_idx+PAPERS_PER_PAGE]):
         with st.container(border=True):
-            # 💡 核心修复 3：扩大右侧动作按钮的列宽比例，彻底消除拥挤感
-            col_chk, col_info, col_btn1, col_btn2, col_btn3 = st.columns([0.4, 6.6, 1.0, 1.0, 1.0])
+            bib = p["bibcode"]
+            c_chk, c_info, c_b1, c_b2, c_b3 = st.columns([0.4, 6.3, 1.1, 1.1, 1.1])
             
-            with col_chk:
-                chk_key = f"chk_{bib}"
-                st.session_state[chk_key] = (bib in st.session_state.selected_bibcodes)
-                
-                def sync_check(b=bib, k=chk_key):
-                    if st.session_state[k]: st.session_state.selected_bibcodes.add(b)
-                    else: st.session_state.selected_bibcodes.discard(b)
-                        
-                st.checkbox("", key=chk_key, on_change=sync_check)
-                
-            with col_info:
-                st.markdown(f"**{global_idx}. [{date}] [引:{cite}] {title}**")
-                
-            with col_btn1:
-                if st.button("📄 摘要", key=f"btn_abs_{bib}", use_container_width=True):
-                    show_abstract_dialog(p, active_ai)
-            with col_btn2:
-                if st.button("✨ 研读", type="primary", key=f"btn_ai_{bib}", use_container_width=True):
-                    show_ai_report_dialog(p, active_ai)
-            with col_btn3:
-                if st.button("📥 下载", key=f"btn_dl_{bib}", use_container_width=True):
-                    fp = os.path.join(cfg["DOWNLOAD_DIR"], f"{sanitize_filename(bib)}.pdf")
-                    if os.path.exists(fp):
-                        st.info("已存在本地！")
-                    else:
-                        urls = find_download_links(p)
-                        succ = False
-                        for _, u in urls:
-                            if download_file(u, fp)[0]: succ = True; break
-                        if succ: st.toast("✅ 下载成功！")
-                        else: st.error("❌ 下载失败")
-                        
+            chk_key = f"chk_{bib}"
+            st.session_state[chk_key] = (bib in st.session_state.selected_bibcodes)
+            def sync_check(b=bib, k=chk_key):
+                if st.session_state[k]: st.session_state.selected_bibcodes.add(b)
+                else: st.session_state.selected_bibcodes.discard(b)
+            
+            c_chk.checkbox("", key=chk_key, on_change=sync_check)
+            c_info.markdown(f"**{start_idx+i+1}.** [{p.get('pubdate','?')}] **{p.get('title',[''])[0]}**")
+            
+            if c_b1.button("📄 摘要", key=f"ab_{i}", use_container_width=True): show_abstract_dialog(p, active_ai)
+            if c_b2.button("AI 研读", key=f"ai_{i}", use_container_width=True, type="primary"): show_ai_report_dialog(p, active_ai)
+            if c_b3.button("📥 下载", key=f"dl_{i}", use_container_width=True):
+                fp = os.path.join(cfg["DOWNLOAD_DIR"], f"{sanitize_filename(bib)}.pdf")
+                if os.path.exists(fp):
+                    st.info("已存在本地！")
+                else:
+                    urls = find_download_links(p)
+                    succ = False
+                    for _, u in urls:
+                        if download_file(u, fp)[0]: succ = True; break
+                    if succ: st.toast("✅ 下载成功！")
+                    else: st.error("❌ 下载失败")
+                    
     st.markdown("<br>", unsafe_allow_html=True)
-    bc1, bc2, bc3, bc4 = st.columns([1, 2, 1, 8])
-    with bc1: st.button("⬅️ 上一页", key="prev_bot", disabled=(st.session_state.current_page == 0), on_click=change_page, args=(-1,))
-    with bc2: st.markdown(f"<div style='text-align: center; margin-top: 5px; font-weight: bold;'>当前页: {st.session_state.current_page + 1} / {total_pages}</div>", unsafe_allow_html=True)
-    with bc3: st.button("下一页 ➡️", key="next_bot", disabled=(st.session_state.current_page >= total_pages - 1), on_click=change_page, args=(1,))
+    bc1, bc2, bc3, bc4 = st.columns([1.5, 2.5, 1.5, 6.5])
+    with bc1: st.button("⬅️ 上一页", key="prev_bot", disabled=st.session_state.current_page==0, on_click=lambda: setattr(st.session_state, 'current_page', st.session_state.current_page-1), use_container_width=True)
+    with bc2: st.markdown(f"<div style='text-align: center; margin-top: 5px; font-weight: bold;'>页码: {st.session_state.current_page + 1} / {total_pages}</div>", unsafe_allow_html=True)
+    with bc3: st.button("下一页 ➡️", key="next_bot", disabled=st.session_state.current_page>=total_pages-1, on_click=lambda: setattr(st.session_state, 'current_page', st.session_state.current_page+1), use_container_width=True)
