@@ -497,6 +497,13 @@ with act4:
 
                     final_dl_count = step1_download_papers(papers_to_process, update_ui)
                     
+                    # 👇 关键修复：新增调用 AI 提取逻辑
+                    if do_ai_extract:
+                        p_text.text("🧠 正在使用 AI 逐篇研读并提炼数据...")
+                        # 调用 step2 进行 AI 数据提炼，生成/更新 CSV
+                        extracted_count = step2_extract_papers(papers_to_process, active_ai, update_ui)
+                        p_text.text(f"✅ AI 提炼完成，共提取 {extracted_count} 篇文献的数据。")
+                    
                     # 💡 强力修复 4：修复了缺失的 ZIP 打包实际逻辑和缩进！
                     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                         for bib in st.session_state.selected_bibcodes:
